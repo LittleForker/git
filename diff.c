@@ -581,11 +581,14 @@ static void emit_rewrite_diff(const char *name_a,
 		line_prefix, metainfo, a_name.buf, name_a_tab, reset,
 		line_prefix, metainfo, b_name.buf, name_b_tab, reset,
 		line_prefix, fraginfo);
-	print_line_count(o->file, lc_a);
+	if (!o->irreversible_delete)
+		print_line_count(o->file, lc_a);
+	else
+		fprintf(o->file, "?,?");
 	fprintf(o->file, " +");
 	print_line_count(o->file, lc_b);
 	fprintf(o->file, " @@%s\n", reset);
-	if (lc_a)
+	if (lc_a && !o->irreversible_delete)
 		emit_rewrite_lines(&ecbdata, '-', data_one, size_one);
 	if (lc_b)
 		emit_rewrite_lines(&ecbdata, '+', data_two, size_two);
@@ -1949,7 +1952,11 @@ static void builtin_diff(const char *name_a,
 		}
 	}
 
-	if (!DIFF_OPT_TST(o, TEXT) &&
+	if (o->irreversible_delete && lbl[1][0] == '/') {
+		fprintf(o->file, "%s", header.buf);
+		strbuf_reset(&header);
+		goto free_ab_and_return;
+	} else if (!DIFF_OPT_TST(o, TEXT) &&
 	    ( (!textconv_one && diff_filespec_is_binary(one)) ||
 	      (!textconv_two && diff_filespec_is_binary(two)) )) {
 		if (fill_mmfile(&mf1, one) < 0 || fill_mmfile(&mf2, two) < 0)
@@ -1969,8 +1976,7 @@ static void builtin_diff(const char *name_a,
 			fprintf(o->file, "%sBinary files %s and %s differ\n",
 				line_prefix, lbl[0], lbl[1]);
 		o->found_changes = 1;
-	}
-	else {
+	} else {
 		/* Crazy xdl interfaces.. */
 		const char *diffopts = getenv("GIT_DIFF_OPTS");
 		xpparam_t xpp;
@@ -3168,6 +3174,9 @@ int diff_opt_parse(struct diff_options *options, const char **av, int ac)
 			return error("invalid argument to -M: %s", arg+2);
 		options->detect_rename = DIFF_DETECT_RENAME;
 	}
+	else if (!strcmp(arg, "-D") || !strcmp(arg, "--irreversible-delete")) {
+		options->irreversible_delete = 1;
+	}
 	else if (!prefixcmp(arg, "-C") || !prefixcmp(arg, "--find-copies=") ||
 		 !strcmp(arg, "--find-copies")) {
 		if (options->detect_rename == DIFF_DETECT_COPY)
@@ -3955,6 +3964,28 @@ static int is_summary_empty(const struct diff_queue_struct *q)
 	return 1;
 }
 
+static const char rename_limit_warning[] =
+"inexact rename detection was skipped due to too many files.";
+
+static const char degrade_cc_to_c_warning[] =
+"only found copies from modified paths due to too many files.";
+
+static const char rename_limit_advice[] =
+"you may want to set your %s variable to at least "
+"%d and retry the command.";
+
+void diff_warn_rename_limit(const char *varname, int needed, int degraded_cc)
+{
+	if (degraded_cc)
+		warning(degrade_cc_to_c_warning);
+	else if (needed)
+		warning(rename_limit_warning);
+	else
+		return;
+	if (0 < needed && needed < 32767)
+		warning(rename_limit_advice, varname, needed);
+}
+
 void diff_flush(struct diff_options *options)
 {
 	struct diff_queue_struct *q = &diff_queued_diff;
@@ -4236,6 +4267,10 @@ void diffcore_std(struct diff_options *options)
 int diff_result_code(struct diff_options *opt, int status)
 {
 	int result = 0;
+
+	diff_warn_rename_limit("diff.renamelimit",
+			       opt->needed_rename_limit,
+			       opt->degraded_cc_to_c);
 	if (!DIFF_OPT_TST(opt, EXIT_WITH_STATUS) &&
 	    !(opt->output_format & DIFF_FORMAT_CHECKDIFF))
 		return status;

@@ -49,13 +49,8 @@ static int parse_decoration_style(const char *var, const char *value)
 	return -1;
 }
 
-static void cmd_log_init(int argc, const char **argv, const char *prefix,
-			 struct rev_info *rev, struct setup_revision_opt *opt)
+static void cmd_log_init_defaults(struct rev_info *rev)
 {
-	int i;
-	int decoration_given = 0;
-	struct userformat_want w;
-
 	rev->abbrev = DEFAULT_ABBREV;
 	rev->commit_format = CMIT_FMT_DEFAULT;
 	if (fmt_pretty)
@@ -68,7 +63,14 @@ static void cmd_log_init(int argc, const char **argv, const char *prefix,
 
 	if (default_date_mode)
 		rev->date_mode = parse_date_format(default_date_mode);
+}
 
+static void cmd_log_init_finish(int argc, const char **argv, const char *prefix,
+			 struct rev_info *rev, struct setup_revision_opt *opt)
+{
+	int i;
+	int decoration_given = 0;
+	struct userformat_want w;
 	/*
 	 * Check for -h before setup_revisions(), or "git log -h" will
 	 * fail when run without a git directory.
@@ -126,6 +128,13 @@ static void cmd_log_init(int argc, const char **argv, const char *prefix,
 		load_ref_decorations(decoration_style);
 	}
 	setup_pager();
+}
+
+static void cmd_log_init(int argc, const char **argv, const char *prefix,
+			 struct rev_info *rev, struct setup_revision_opt *opt)
+{
+	cmd_log_init_defaults(rev);
+	cmd_log_init_finish(argc, argv, prefix, rev, opt);
 }
 
 /*
@@ -247,6 +256,8 @@ static void finish_early_output(struct rev_info *rev)
 static int cmd_log_walk(struct rev_info *rev)
 {
 	struct commit *commit;
+	int saved_nrl = 0;
+	int saved_dcctc = 0;
 
 	if (rev->early_output)
 		setup_early_output(rev);
@@ -277,7 +288,14 @@ static int cmd_log_walk(struct rev_info *rev)
 		}
 		free_commit_list(commit->parents);
 		commit->parents = NULL;
+		if (saved_nrl < rev->diffopt.needed_rename_limit)
+			saved_nrl = rev->diffopt.needed_rename_limit;
+		if (rev->diffopt.degraded_cc_to_c)
+			saved_dcctc = 1;
 	}
+	rev->diffopt.degraded_cc_to_c = saved_dcctc;
+	rev->diffopt.needed_rename_limit = saved_nrl;
+
 	if (rev->diffopt.output_format & DIFF_FORMAT_CHECKDIFF &&
 	    DIFF_OPT_TST(&rev->diffopt, CHECK_FAILED)) {
 		return 02;
@@ -396,6 +414,7 @@ int cmd_show(int argc, const char **argv, const char *prefix)
 	struct rev_info rev;
 	struct object_array_entry *objects;
 	struct setup_revision_opt opt;
+	struct pathspec match_all;
 	int i, count, ret = 0;
 
 	git_config(git_log_config, NULL);
@@ -403,6 +422,7 @@ int cmd_show(int argc, const char **argv, const char *prefix)
 	if (diff_use_color_default == -1)
 		diff_use_color_default = git_use_color_default;
 
+	init_pathspec(&match_all, NULL);
 	init_revisions(&rev, prefix);
 	rev.diff = 1;
 	rev.always_show_header = 1;
@@ -449,7 +469,7 @@ int cmd_show(int argc, const char **argv, const char *prefix)
 					diff_get_color_opt(&rev.diffopt, DIFF_COMMIT),
 					name,
 					diff_get_color_opt(&rev.diffopt, DIFF_RESET));
-			read_tree_recursive((struct tree *)o, "", 0, 0, NULL,
+			read_tree_recursive((struct tree *)o, "", 0, 0, &match_all,
 					show_tree_object, NULL);
 			rev.shown_one = 1;
 			break;
@@ -486,16 +506,11 @@ int cmd_log_reflog(int argc, const char **argv, const char *prefix)
 	rev.verbose_header = 1;
 	memset(&opt, 0, sizeof(opt));
 	opt.def = "HEAD";
-	cmd_log_init(argc, argv, prefix, &rev, &opt);
-
-	/*
-	 * This means that we override whatever commit format the user gave
-	 * on the cmd line.  Sad, but cmd_log_init() currently doesn't
-	 * allow us to set a different default.
-	 */
+	cmd_log_init_defaults(&rev);
 	rev.commit_format = CMIT_FMT_ONELINE;
 	rev.use_terminator = 1;
 	rev.always_show_header = 1;
+	cmd_log_init_finish(argc, argv, prefix, &rev, &opt);
 
 	return cmd_log_walk(&rev);
 }

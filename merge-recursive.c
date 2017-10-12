@@ -22,11 +22,6 @@
 #include "dir.h"
 #include "submodule.h"
 
-static const char rename_limit_advice[] =
-"inexact rename detection was skipped because there were too many\n"
-"  files. You may want to set your merge.renamelimit variable to at least\n"
-"  %d and retry this merge.";
-
 static struct tree *shift_tree_object(struct tree *one, struct tree *two,
 				      const char *subtree_shift)
 {
@@ -278,7 +273,9 @@ static int save_files_dirs(const unsigned char *sha1,
 static int get_files_dirs(struct merge_options *o, struct tree *tree)
 {
 	int n;
-	if (read_tree_recursive(tree, "", 0, 0, NULL, save_files_dirs, o))
+	struct pathspec match_all;
+	init_pathspec(&match_all, NULL);
+	if (read_tree_recursive(tree, "", 0, 0, &match_all, save_files_dirs, o))
 		return 0;
 	n = o->current_file_set.nr + o->current_directory_set.nr;
 	return n;
@@ -344,10 +341,11 @@ static void make_room_for_directories_of_df_conflicts(struct merge_options *o,
 	 * make room for the corresponding directory.  Such paths will
 	 * later be processed in process_df_entry() at the end.  If
 	 * the corresponding directory ends up being removed by the
-	 * merge, then the file will be reinstated at that time;
-	 * otherwise, if the file is not supposed to be removed by the
-	 * merge, the contents of the file will be placed in another
-	 * unique filename.
+	 * merge, then the file will be reinstated at that time
+	 * (albeit with a different timestamp!); otherwise, if the
+	 * file is not supposed to be removed by the merge, the
+	 * contents of the file will be placed in another unique
+	 * filename.
 	 *
 	 * NOTE: This function relies on the fact that entries for a
 	 * D/F conflict will appear adjacent in the index, with the
@@ -357,6 +355,13 @@ static void make_room_for_directories_of_df_conflicts(struct merge_options *o,
 	const char *last_file = NULL;
 	int last_len = 0;
 	int i;
+
+	/*
+	 * Do not do any of this crazyness during the recursive; we don't
+	 * even write anything to the working tree!
+	 */
+	if (o->call_depth)
+		return;
 
 	for (i = 0; i < entries->nr; i++) {
 		const char *path = entries->items[i].string;
@@ -425,6 +430,7 @@ static struct string_list *get_renames(struct merge_options *o,
 	opts.rename_score = o->rename_score;
 	opts.show_rename_progress = o->show_rename_progress;
 	opts.output_format = DIFF_FORMAT_NO_OUTPUT;
+	opts.break_opt = 0;
 	if (diff_setup_done(&opts) < 0)
 		die("diff setup failed");
 	diff_tree_sha1(o_tree->object.sha1, tree->object.sha1, "", &opts);
@@ -702,6 +708,64 @@ static void update_file(struct merge_options *o,
 			const char *path)
 {
 	update_file_flags(o, sha, mode, path, o->call_depth || clean, !o->call_depth);
+}
+
+static int update_or_remove(struct merge_options *o,
+			    const unsigned char *sha1, unsigned mode,
+			    const char *path, int update_wd)
+{
+	if (is_null_sha1(sha1))
+		return remove_file(o, 1, path, !update_wd);
+
+	update_file_flags(o, sha1, mode, path, 1, update_wd);
+	return 0;
+}
+
+static void merge_rename_source(struct merge_options *o,
+				       const char *path,
+				       struct stage_data *d)
+{
+	if (is_null_sha1(d->stages[2].sha)) {
+		/*
+		 * If both were real renames (not from a broken pair), we can
+		 * stop caring about the path. We don't touch the working
+		 * directory, though. The path must be gone in HEAD, so there
+		 * is no point (and anything we did delete would be an
+		 * untracked file).
+		 */
+		if (is_null_sha1(d->stages[3].sha)) {
+			remove_file(o, 1, path, 1);
+			return;
+		}
+
+		/*
+		 * If "ours" was a real rename, but the other side came
+		 * from a broken pair, then their version is the right
+		 * resolution (because we have no content, ours having been
+		 * renamed away, and they have new content).
+		 */
+		update_file_flags(o, d->stages[3].sha, d->stages[3].mode,
+				  path, 1, 1);
+		return;
+	}
+
+	/*
+	 * Now we have the opposite. "theirs" is a real rename, but ours
+	 * is from a broken pair. We resolve in favor of us, but we don't
+	 * need to touch the working directory.
+	 */
+	if (is_null_sha1(d->stages[3].sha)) {
+		update_file_flags(o, d->stages[2].sha, d->stages[2].mode,
+				  path, 1, 0);
+		return;
+	}
+
+	/*
+	 * Otherwise, both came from broken pairs. We need to do an actual
+	 * merge on the entries. We can just mark it as unprocessed and
+	 * the regular code will handle it.
+	 */
+	d->processed = 0;
 }
 
 /* Low level file merging, update and removal */
@@ -1021,7 +1085,7 @@ static int process_renames(struct merge_options *o,
 							      ren1->dst_entry,
 							      ren2->dst_entry);
 			} else {
-				remove_file(o, 1, ren1_src, 1);
+				merge_rename_source(o, ren1_src, ren1->src_entry);
 				update_stages_and_entry(ren1_dst,
 							ren1->dst_entry,
 							ren1->pair->one,
@@ -1045,7 +1109,10 @@ static int process_renames(struct merge_options *o,
 			int renamed_stage = a_renames == renames1 ? 2 : 3;
 			int other_stage =   a_renames == renames1 ? 3 : 2;
 
-			remove_file(o, 1, ren1_src, o->call_depth || renamed_stage == 2);
+			update_or_remove(o,
+				ren1->src_entry->stages[renamed_stage].sha,
+				ren1->src_entry->stages[renamed_stage].mode,
+				ren1_src, renamed_stage == 3);
 
 			hashcpy(src_other.sha1, ren1->src_entry->stages[other_stage].sha);
 			src_other.mode = ren1->src_entry->stages[other_stage].mode;
@@ -1260,9 +1327,13 @@ static int merge_content(struct merge_options *o,
 	}
 
 	if (mfi.clean && !df_conflict_remains &&
-	    sha_eq(mfi.sha, a_sha) && mfi.mode == a.mode)
+	    sha_eq(mfi.sha, a_sha) && mfi.mode == a.mode &&
+	    !o->call_depth && !lstat(path, &st)) {
 		output(o, 3, "Skipped %s (merged same as existing)", path);
-	else
+		add_cacheinfo(mfi.mode, mfi.sha, path,
+			      0 /*stage*/, 1 /*refresh*/, 0 /*options*/);
+		return mfi.clean;
+	} else
 		output(o, 2, "Auto-merging %s", path);
 
 	if (!mfi.clean) {
@@ -1652,8 +1723,9 @@ int merge_recursive(struct merge_options *o,
 		commit_list_insert(h2, &(*result)->parents->next);
 	}
 	flush_output(o);
-	if (o->needed_rename_limit)
-		warning(rename_limit_advice, o->needed_rename_limit);
+	if (show(o, 2))
+		diff_warn_rename_limit("merge.renamelimit",
+				       o->needed_rename_limit, 0);
 	return clean;
 }
 
